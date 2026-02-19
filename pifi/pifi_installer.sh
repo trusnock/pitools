@@ -1,44 +1,173 @@
 sudo tee /usr/local/bin/piwifi >/dev/null <<'EOF'
 #!/bin/bash
+# =============================================================================
+# piwifi - Wi-Fi Network Manager Control Script
+# =============================================================================
+# PURPOSE:
+#   This script provides a unified interface to manage Wi-Fi connections
+#   across multiple Linux network managers (NetworkManager, iwd, wpa_supplicant,
+#   connman). It allows users to add networks, switch managers, and diagnose
+#   connectivity issues.
+#
+# SUPPORTED MANAGERS:
+#   - NetworkManager: Primary manager for most modern Linux distributions
+#   - iwd: Intel Wireless Daemon (newer, faster alternative)
+#   - wpa_supplicant: Legacy wireless daemon
+#   - connman: ConnMan connection manager
+#
+# USAGE:
+#   piwifi <command> [args]
+#   IFACE=wlan1 piwifi report    (specify network interface)
+#
+# ENVIRONMENT:
+#   IFACE: Network interface name (default: wlan0)
+#
+# DATE CREATED:
+#   2026-02-19 02:46:21 UTC
+#
+# =============================================================================
+
 set -euo pipefail
 
-IFACE="${IFACE:-wlan0}"
-NM_CONF="/etc/NetworkManager/NetworkManager.conf"
-NM_DIR="/etc/NetworkManager/system-connections"
+# Configuration variables
+IFACE="${IFACE:-wlan0}"                                    # Network interface to manage
+NM_CONF="/etc/NetworkManager/NetworkManager.conf"          # NetworkManager config file
+NM_DIR="/etc/NetworkManager/system-connections"            # Directory storing NM profiles
 
-exists(){ command -v "$1" >/dev/null 2>&1; }
-act(){ systemctl is-active --quiet "$1"; }
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
 
+# exists()
+# PURPOSE: Check if a command is available in the system PATH
+# PARAMETERS:
+#   $1: Command name to search for
+# RETURNS:
+#   0 (success) if command exists, 1 (failure) if not found
+# EXAMPLE:
+#   if exists nmcli; then echo "NetworkManager CLI found"; fi
+exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+# act()
+# PURPOSE: Check if a systemd service is currently active (running)
+# PARAMETERS:
+#   $1: Service name (e.g., 'NetworkManager', 'iwd')
+# RETURNS:
+#   0 (success) if service is active, 1 (failure) if not
+# EXAMPLE:
+#   if act NetworkManager; then echo "NetworkManager is running"; fi
+act() {
+  systemctl is-active --quiet "$1"
+}
+
+# =============================================================================
+# CONTROLLER DETECTION FUNCTION
+# =============================================================================
+
+# detect_controller()
+# PURPOSE: Identify which network manager is currently controlling the interface
+# STRATEGY:
+#   The function checks managers in this order:
+#   1. NetworkManager (most common, has detailed state info via nmcli)
+#   2. iwd (modern replacement, faster)
+#   3. wpa_supplicant (legacy daemon, widely compatible)
+#   4. connman (alternative manager, less common)
+#
+# OUTPUT FORMAT:
+#   Prints pipe-separated values: MANAGER_NAME|REASON
+#   Example: "NetworkManager|NetworkManager active; wlan0 is connected:MyWiFi"
+#
+# RETURNS:
+#   0 on success (always succeeds, may report 'unknown' manager)
 detect_controller() {
   local nm_raw="" mgr="unknown" reason=""
+  
+  # Check if NetworkManager is active and nmcli command is available
   if act NetworkManager && exists nmcli; then
-    nm_raw="$(nmcli -t -f DEVICE,STATE,CONNECTION d 2>/dev/null | awk -F: -v i="$IFACE" '$1==i{print $2":"$3}')"
+    # Query NetworkManager for device state using nmcli
+    # -t: terse output (parseable format)
+    # -f: specify fields to return (DEVICE, STATE, CONNECTION)
+    # d: shorthand for "device"
+    # awk: extract the state (field 2) and connection name (field 3) for our interface
+    nm_raw=""$(nmcli -t -f DEVICE,STATE,CONNECTION d 2>/dev/null | awk -F: -v i="$IFACE" '$1==i{print $2":"$3}')""
+    
+    # Match against known NetworkManager states
     case "$nm_raw" in
       connected:*)  mgr="NetworkManager"; reason="NetworkManager active; $IFACE is $nm_raw";;
       connecting:*) mgr="NetworkManager"; reason="NetworkManager active; $IFACE is $nm_raw";;
-      *) : ;;
+      *) : ;;  # No match, continue checking other managers
     esac
   fi
+  
+  # Check remaining managers only if NetworkManager wasn't found managing this interface
   if [[ "$mgr" == "unknown" ]] && act iwd;            then mgr="iwd";            reason="iwd active"; fi
   if [[ "$mgr" == "unknown" ]] && act wpa_supplicant; then mgr="wpa_supplicant"; reason="wpa_supplicant active"; fi
   if [[ "$mgr" == "unknown" ]] && act connman;        then mgr="connman";        reason="connman active"; fi
+  
+  # Output result in pipe-separated format for easy parsing
   printf "%s|%s\n" "$mgr" "$reason"
 }
 
+# =============================================================================
+# DNS DISCOVERY FUNCTION
+# =============================================================================
+
+# discover_dns()
+# PURPOSE: Locate DNS servers configured for the network interface
+# STRATEGY (Fallback Chain):
+#   Attempts multiple methods in order until DNS servers are found:
+#   1. NetworkManager's nmcli (most reliable when NM is active)
+#   2. systemd's resolvectl (modern resolver, provides interface-specific DNS)
+#   3. NetworkManager's resolv.conf (if NM manages resolution)
+#   4. System's resolv.conf (global fallback)
+#
+# OUTPUT:
+#   Comma-separated list of DNS server IPs, or "none" if not found
+# EXAMPLE:
+#   8.8.8.8,8.8.4.4
 discover_dns() {
   local dns=""
+  
+  # Method 1: Try NetworkManager's nmcli (most direct if NM is active)
   if act NetworkManager && exists nmcli; then
+    # Query DNS servers configured for this interface
+    # -g: parseable output (gettext format)
+    # IP4.DNS: field for IPv4 DNS servers
+    # device show: get device-specific configuration
     dns="$(nmcli -g IP4.DNS device show "$IFACE" 2>/dev/null | sed '/^$/d' | paste -sd, - || true)"
   fi
+  
+  # Method 2: Try systemd's resolvectl (modern resolver tool)
   if [[ -z "$dns" ]] && exists resolvectl; then
+    # Get DNS servers for this specific interface
     dns="$(resolvectl dns "$IFACE" 2>/dev/null | awk '{for(i=2;i<=NF;i++)print $i}' | paste -sd, - || true)"
+    
+    # Fallback: Get global DNS servers if interface-specific not found
     [[ -z "$dns" ]] && dns="$(resolvectl status 2>/dev/null | awk '/^\s*DNS Servers:/{for(i=3;i<=NF;i++)print $i}' | paste -sd, - || true)"
   fi
+  
+  # Method 3: Try NetworkManager's resolv.conf backup file
   [[ -z "$dns" && -r /run/NetworkManager/resolv.conf ]] && dns="$(awk '/^[[:space:]]*nameserver/{print $2}' /run/NetworkManager/resolv.conf | paste -sd, -)"
+  
+  # Method 4: Fall back to system's resolv.conf (global configuration)
   [[ -z "$dns" && -r /etc/resolv.conf ]] && dns="$(awk '/^[[:space:]]*nameserver/{print $2}' /etc/resolv.conf | paste -sd, -)"
+  
+  # Output result with fallback to "none"
   echo "${dns:-none}"
 }
 
+# =============================================================================
+# REPORT HELPER FUNCTIONS (NetworkManager specific)
+# =============================================================================
+
+# report_nm_saved_all()
+# PURPOSE: List all saved Wi-Fi connections managed by NetworkManager
+# OUTPUT FORMAT:
+#   - Connection Name (uuid:..., dev:..., active:yes|no)
+# FILTERS:
+#   Only shows connections of type wifi or 802-11-wireless
 report_nm_saved_all() {
   nmcli -t -f NAME,UUID,TYPE,DEVICE,ACTIVE connection show 2>/dev/null | \
   awk -F: '$3 ~ /^(wifi|802-11-wireless)$/ {
@@ -46,6 +175,12 @@ report_nm_saved_all() {
   }' || true
 }
 
+# report_nm_saved_inactive()
+# PURPOSE: List Wi-Fi connections saved in NetworkManager but NOT currently active
+# USAGE:
+#   Shows profiles that could be used but aren't running on this interface
+# FILTERS:
+#   Wi-Fi type + (not on current interface OR not active)
 report_nm_saved_inactive() {
   nmcli -t -f NAME,UUID,TYPE,DEVICE,ACTIVE connection show 2>/dev/null | \
   awk -F: -v IFACE="$IFACE" '$3 ~ /^(wifi|802-11-wireless)$/ && ($4 != IFACE || $5 != "yes") {
@@ -53,119 +188,66 @@ report_nm_saved_inactive() {
   }' || true
 }
 
+# report_keyfiles_unloaded()
+# PURPOSE: Identify NetworkManager keyfiles (.nmconnection) that exist but aren't loaded
+# DIAGNOSTIC VALUE:
+#   Finds orphaned profiles that NetworkManager didn't pick up (corruption, permission issues)
+# LOGIC:
+#   1. Get list of all loaded connection UUIDs from nmcli
+#   2. Scan all .nmconnection files in NM_DIR
+#   3. For each file, extract its UUID
+#   4. If UUID not in loaded list, report the file as unloaded
 report_keyfiles_unloaded() {
   local loaded
+  # Get all currently loaded connection UUIDs from NetworkManager
   loaded="$(nmcli -t -f UUID connection show 2>/dev/null | tr -d '\r')"
   local any=0
+  
+  # Check each .nmconnection file in the NM system-connections directory
   for f in "$NM_DIR"/*.nmconnection; do
-    [[ -f "$f" ]] || continue
+    [[ -f "$f" ]] || continue  # Skip if not a regular file
+    
     local uuid
+    # Extract UUID from keyfile (format: uuid=<uuid-string>)
     uuid="$(awk -F= '/^uuid/{print $2}' "$f" 2>/dev/null | tr -d '\r')"
-    [[ -z "$uuid" ]] && continue
+    [[ -z "$uuid" ]] && continue  # Skip if UUID not found
+    
+    # Check if this UUID is in the loaded list
     if ! grep -q "$uuid" <<<"$loaded"; then
       echo "- $(basename "$f")"
       any=1
     fi
   done
+  
+  # Report "none" if all keyfiles are loaded
   [[ $any -eq 0 ]] && echo "none"
 }
 
+# =============================================================================
+# MAIN REPORT FUNCTION
+# =============================================================================
+
+# report()
+# PURPOSE: Generate comprehensive diagnostic report of Wi-Fi configuration and status
+# OUTPUT:
+#   - Detected network manager and why
+#   - Current interface state (SSID, IP, gateway, DNS)
+#   - List of all saved connections
+#   - Connectivity tests (ping to IP and DNS)
 report() {
-  local ctrl reason; IFS='|' read -r ctrl reason < <(detect_controller)
-  local link ip4 gw dns ssid nm_line
+  # Detect which manager is controlling this interface
+  local ctrl reason
+  IFS='|' read -r ctrl reason < <(detect_controller)
+  
+  # Gather current interface information
+  local link ip4 gw dns ssid nm_line  
+  
+  # Get detailed wireless link information (SSID, signal strength, etc.)
   link="$(iw "$IFACE" link 2>/dev/null || true)"
   [[ -z "$link" ]] && link="(iw not available or $IFACE down)"
+  
+  # Get IPv4 addresses assigned to this interface
   ip4="$(ip -4 addr show "$IFACE" 2>/dev/null | awk '/inet /{print $2}' | paste -sd, - || true)"
-  gw="$(ip route show default 2>/dev/null | awk '/default/ && /'"$IFACE"'/ {print $3}' | head -n1)"
-  ssid="$(printf "%s" "$link" | awk -F': ' '/SSID:/{print $2; exit}')"
-  dns="$(discover_dns)"
-  if act NetworkManager && exists nmcli; then
-    nm_line="$(nmcli -t -f DEVICE,STATE,CONNECTION d 2>/dev/null | awk -F: -v i="$IFACE" '$1==i{print $0}')"
-  fi
-
-  echo "Wi-Fi control report for $IFACE"
-  echo "Controller: $ctrl"
-  [[ -n "$reason" ]] && echo "Reason: $reason"
-  [[ -n "$nm_line" ]] && echo "NM device line: $nm_line"
-  echo "SSID: ${ssid:-unknown}"
-  echo "IPv4: ${ip4:-none}"
-  echo "Gateway: ${gw:-none}"
-  echo "DNS: $dns"
-  echo "iw link:"
-  echo "$link"
-
-  echo "All saved Wi-Fi connections:"
-  case "$ctrl" in
-    NetworkManager) report_nm_saved_all || echo "none" ;;
-    wpa_supplicant)
-      [[ -f /etc/wpa_supplicant/wpa_supplicant.conf ]] &&
-      awk 'BEGIN{RS="network=";FS="\n"}
-        { ss="";pr="";dis="";
-          if (match($0,/ssid="([^"]+)"/,m)) ss=m[1];
-          if (match($0,/priority=([0-9]+)/,m)) pr=m[1]; else pr="0";
-          if (match($0,/disabled=([0-9]+)/,m)) dis=m[1]; else dis="";
-          if (ss!=""){ ac=(dis==""||dis=="0")?"yes":"no";
-            printf("- %s (autoconnect:%s, priority:%s)\n",ss,ac,pr);
-          }
-        }' /etc/wpa_supplicant/wpa_supplicant.conf || echo "none"
-      ;;
-    iwd)
-      if exists iwctl; then iwctl known-networks list 2>/dev/null | awk 'NR>1{print "- "$1}' || echo "none"
-      else [[ -d /var/lib/iwd ]] && ls -1 /var/lib/iwd/*.psk 2>/dev/null | sed 's#.*/#- #' | sed 's/\.psk$//' || echo "none"; fi
-      ;;
-    *) echo "none";;
-  esac
-
-  if [[ "$ctrl" = "NetworkManager" ]]; then
-    echo "Configured (not active on $IFACE):"
-    report_nm_saved_inactive || echo "none"
-
-    echo "Keyfiles present but NOT loaded by NM:"
-    report_keyfiles_unloaded
-  fi
-
-  ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 && ip_ok=ok || ip_ok=fail
-  ping -c1 -W1 google.com >/dev/null 2>&1 && dns_ok=ok || dns_ok=fail
-  echo "Connectivity: ping IP=$ip_ok, DNS+IP=$dns_ok"
-}
-
-usage() {
-  cat <<USAGE
-Usage: piwifi <command> [args]
-
-Commands:
-  report                 Show controller, link/IP/DNS, and saved networks
-  add <SSID> <PSK>       Add a Wi-Fi network
-  fix-nm                 Enable NM keyfile + managed=true, restart NM
-  adopt                  Stop external owners and hand iface to NM
-  prune <NAME|UUID>      Delete an NM Wi-Fi profile
-  rename-current         Rename "preconfigured" to current SSID
-  help, --help           Show this help
-
-Env:
-  IFACE=wlan0 (default)
-USAGE
-}
-
-rename_current() {
-  local cur ssid
-  ssid="$(iw "$IFACE" link 2>/dev/null | awk -F': ' '/SSID:/{print $2; exit}')"
-  cur="$(nmcli -t -f NAME,DEVICE connection show --active | awk -F: -v i="$IFACE" '$2==i{print $1; exit}')"
-  [[ -n "$cur" && "$cur" == "preconfigured" && -n "$ssid" ]] && nmcli connection modify "$cur" connection.id "$ssid"
-  report
-}
-
-cmd="${1:-help}"
-case "$cmd" in
-  report) report ;;
-  add) shift; [[ $# -ge 2 ]] || { echo "need SSID and PSK"; exit 1; }; nmcli dev wifi connect "$1" password "$2" ifname "$IFACE" || nmcli con add type wifi ifname "$IFACE" con-name "$1" ssid "$1" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$2"; report ;;
-  fix-nm) sudo sed -i '/^\[ifupdown\]/,/^\[/!b;/^\[/!d;a managed=true' "$NM_CONF"; sudo systemctl restart NetworkManager; report ;;
-  adopt) sudo systemctl disable --now wpa_supplicant@${IFACE} >/dev/null 2>&1 || true; sudo systemctl disable --now iwd >/dev/null 2>&1 || true; nmcli device set "$IFACE" managed yes; sudo systemctl restart NetworkManager; report ;;
-  prune) shift; [[ $# -ge 1 ]] || { echo "need NAME or UUID"; exit 1; }; nmcli con delete "$1"; report ;;
-  rename-current) rename_current ;;
-  help|--help|-h|"") usage ;;
-  *) usage; exit 1 ;;
-esac
-EOF
-sudo chmod +x /usr/local/bin/piwifi
-
+  
+  # Get default gateway (typically found on the default route)
+  gw="$(ip route show default 2>/dev/null | awk '/default/ && /'
